@@ -1,32 +1,247 @@
 ---
 id: realtime
 title: Realtime
-description: Using Supabase Realtime for multiplayer functionality.
+description: Supabase Realtime with Broadcast, Presence, and PostgreSQL Change Data Capture (CDC).
 sidebar_label: Overview
 ---
 
-Supabase provides a Realtime API using [Realtime](https://github.com/supabase/realtime).
+Supabase provides a globally distributed cluster of [Realtime](https://github.com/supabase/realtime) servers that enable the following functionality:
 
-You can use this to:
+- **Broadcast**: Send ephemeral messages from client to clients with low latency.
+- **Presence**: Track and synchrononize shared state between clients.
+- **PostgreSQL CDC**: Listen to PostgreSQL database changes and send them to authorized clients.
 
-- broadcast messages between users
-- manage shared state between users
-- listen to database changes over websockets
+## Channel
 
-## Realtime Channels
+In Realtime, a [channel](https://hexdocs.pm/phoenix/channels.html) is the basic building block and narrows the scope of data flow to participants. You can think of a channel as a chatroom where users join and leave; similar to a Slack or Discord channel.
 
-In Realtime, everything is a [_channel_](https://hexdocs.pm/phoenix/channels.html).
-Channels are like chatrooms where participants can join and leave—similar to Slack or Discord channels.
+## Prerequisites
 
-### Broadcast
+### supabase-js v2
 
-Broadcast follows the classic Publisher/Subscriber pattern. A client (publisher) “broadcasts” messages using a unique identifier. For example, a user could send a message to a `#random` channel.
+- You will need `supabase-js` `v2` to access all Realtime functionality.
 
-Other clients (subscribers) can “listen” to these messages in real-time, using the unique identifier. If they are listening to the `#random` channel, then they will receive the message.
+```bash
+npm i @supabase/supabase-js@rc
+```
+
+### Access Token
+
+- You will need a `SUPABASE_KEY` that's a valid JSON web token (JWT) signed with your project's JWT secret. You can get started with the public `anon` key found in your project's [API settings](https://app.supabase.com/project/_/settings/api).
+
+:::note
+The JWT claims must contain `exp` and `role`(any database role).
+:::
+
+## Getting Started
+
+### Creating a Channel
+
+You can create your first channel:
+
+```js
+const { createClient } = require('@supabase/supabase-js')
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+)
+
+// subscribe sends your client's channel request to the server
+const channel = supabase.channel('room-abc').subscribe()
+```
+
+:::note
+Channel name can be any string and will act as its unique identifier.
+:::
+
+### Subscribe States
+
+There are four subscribe states (case sensitive) to pay attention to:
+
+- `SUBSCRIBED`
+- `ClOSED`
+- `TIMED_OUT`
+- `CHANNEL_ERROR`
+
+You can take an action depending on the state:
+
+```js
+// Supabase client setup
+
+const channel = supabase.channel('room-abc').subscribe((status, err) => {
+  if (status === 'SUBSCRIBED') {
+    console.log('Subscribed to channel')
+  }
+
+  if (status === 'CLOSED') {
+    console.log('Channel unexpectedly closed')
+  }
+
+  if (status === 'TIMED_OUT') {
+    console.log("Server didn't respond in time")
+  }
+
+  if (status === 'CHANNEL_ERROR') {
+    console.log(`Error subscribing to channel: ${err.message}`)
+  }
+})
+```
+
+### Rate Limiting
+
+`eventsPerSecond` dictates how often an event can be sent to the Realtime server. The default is `10`, which means you can send one event every 100 milliseconds. If you send more within a given time interval then your channel will respond with a `rate limited` error message.
+
+You can customize this by:
+
+```js
+const { createClient } = require('@supabase/supabase-js')
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY,
+  {
+    realtime: {
+      params: {
+        eventsPerSecond: 20,
+      },
+    },
+  }
+)
+
+const channel = supabase.channel('room-abc').subscribe()
+```
+
+:::note
+Realtime server has its own rate limiting to maintain performance and prevent abuse. Free tier plans are allowed a maximum of 200 concurrent clients.
+:::
+
+## Broadcast
+
+### Overview
+
+Broadcast follows the classic Publisher/Subscriber pattern. A client (publisher) “broadcasts” messages via a channel and its unique identifier. For example, a user could send a message to a `room-abc` channel.
+
+Other clients (subscribers) can receive these messages in real-time by subscribing to the channel with the unique identifier `room-abc`.
+
+Broadcast messages are not stored anywhere so clients wishing to receive them must be subscribed to the channel when they are sent.
 
 A common use-case for Broadcast is sharing a user's cursor position with other clients in an online game.
 
-### Presence
+### Usage
+
+You can broadcast a message by:
+
+```js
+// Supabase client setup
+
+const channel = supabase.channel('room-abc', {
+  configs: {
+    broadcast: {
+      ack: false,
+      self: false,
+    },
+  },
+})
+
+channel.subscribe((status) => {
+  if (status === 'SUBSCRIBED') {
+    // now you can start broadcasting messages
+    setInterval(async () => {
+      const status = await channel.send({
+        type: 'broadcast',
+        event: 'location',
+        payload: { user: 'abc1', x: Math.random(), y: Math.random() },
+      })
+      console.log('Status: ', status)
+    }, 1000)
+  }
+})
+```
+
+You can listen to broadcast messages by running the following script in another tab:
+
+```js
+// Supabase client setup
+
+const channel = supabase.channel('room-abc')
+
+channel
+  .on('broadcast', { event: 'location' }, (payload) => console.log(payload))
+  .subscribe((status) => {
+    if (status === 'SUBSCRIBED') {
+      // your callback function in the 'on' handler will now be called with the received messages
+      console.log('Connected to channel')
+    }
+  })
+```
+
+:::note
+`type` must always be `'broadcast'` (case insensitive) and `event` (case insensitive) must match.
+:::
+
+### Options
+
+- `ack`
+
+You can set the `ack` config to `true` when you want receipt that the Realtime server received your client's message that they want to broadcast. The default is `false`, in which case the promise will resolve immediately.
+
+```js
+// Supabase client setup
+
+const channel = supabase.channel('room-abc', {
+  configs: {
+    broadcast: {
+      ack: true,
+    },
+  },
+})
+
+channel.subscribe((status) => {
+  if (status === 'SUBSCRIBED') {
+    const start = performance.now()
+    await channel.send({
+      type: 'broadcast',
+      event: 'latency',
+      payload: {},
+    })
+    console.log(`Roundtrip latency: ${performance.now() - start} milliseconds`)
+  }
+})
+```
+
+- `self`
+
+You can set the `self` config to `true`, defaults to `false`, if you want the client who broadcast the message to receive it.
+
+```js
+// Supabase client setup
+
+const channel = supabase.channel('room-abc', {
+  configs: {
+    broadcast: {
+      self: true,
+    },
+  },
+})
+
+channel
+  .on('broadcast', { event: 'me' }, (payload) => console.log(payload))
+  .subscribe((status) => {
+    if (status === 'SUBSCRIBED') {
+      channel.send({
+        type: 'broadcast',
+        event: 'me',
+        payload: { message: 'Right back at ya!' },
+      })
+      // your callback function in the 'on' handler will be called once server broadcasts this client's message
+    }
+  })
+```
+
+## Presence
+
+### Overview
 
 Presence synchronizes shared state between users.
 Presence is very similar to Broadcast, except that the state is “persisted” in the Channel
@@ -37,8 +252,20 @@ sending an “I'm online” message to the new-joiner. Presence utilizes Broadca
 The neat thing about Presence is that if a user is suddenly disconnected (for example, they go offline), their state will be automatically removed from the shared state.
 If you've ever tried to build an “I'm online” feature which handles unexpected disconnects, you'll appreciate how useful this is.
 
-### Database changes
+### Usage
+
+### Options
+
+## PostgreSQL CDC
+
+### Overview
 
 You can subscribe to database changes using Realtime.
 The Realtime API works through PostgreSQL's replication functionality. Postgres sends database changes to a [publication](/docs/guides/database/replication#publications)
 called `supabase_realtime`, and by managing this publication you can control which data is broadcast.
+
+### Usage
+
+### Filters
+
+### Debugging
